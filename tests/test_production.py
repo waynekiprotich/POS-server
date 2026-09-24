@@ -26,15 +26,27 @@ def test_production_refuses_default_secrets():
         create_app(config)
 
 
-def test_production_refuses_sqlite():
+def test_cloud_mode_refuses_sqlite():
     config = _config(
         PRODUCTION=True,
+        POS_MODE="cloud",
         SECRET_KEY=STRONG,
         JWT_SECRET_KEY=STRONG,
         SQLALCHEMY_DATABASE_URI="sqlite://",
     )
     with pytest.raises(RuntimeError, match="DATABASE_URL"):
         create_app(config)
+
+
+def test_local_shop_mode_runs_on_sqlite():
+    config = _config(
+        PRODUCTION=True,
+        POS_MODE="local",
+        SECRET_KEY=STRONG,
+        JWT_SECRET_KEY=STRONG,
+        SQLALCHEMY_DATABASE_URI="sqlite://",
+    )
+    assert create_app(config) is not None
 
 
 def test_production_starts_with_complete_config():

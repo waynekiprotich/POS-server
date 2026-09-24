@@ -3,12 +3,15 @@ from ..utils.money import money_str
 from .user import utcnow
 
 PAYMENT_METHODS = ("cash", "mpesa", "card", "other")
+SALE_COMPLETED = "completed"
+SALE_VOIDED = "voided"
 
 
 class Sale(db.Model):
     __tablename__ = "sales"
 
     id = db.Column(db.Integer, primary_key=True)
+    business_id = db.Column(db.Integer, db.ForeignKey("businesses.id"), index=True)
     sale_number = db.Column(db.String(24), unique=True, nullable=False, index=True)
     cashier_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
     subtotal = db.Column(db.Numeric(12, 2), nullable=False, default=0)
@@ -16,12 +19,22 @@ class Sale(db.Model):
     tax = db.Column(db.Numeric(12, 2), nullable=False, default=0)
     total = db.Column(db.Numeric(12, 2), nullable=False, default=0)
     payment_status = db.Column(db.String(20), nullable=False, default="paid")
+    # Completed sales are never edited. A void keeps the record, marks it and
+    # puts the stock back; reports count completed sales only.
+    status = db.Column(
+        db.String(20), nullable=False, default=SALE_COMPLETED, server_default=SALE_COMPLETED,
+        index=True,
+    )
+    voided_at = db.Column(db.DateTime(timezone=True))
+    voided_by_id = db.Column(db.Integer, db.ForeignKey("users.id"))
+    void_reason = db.Column(db.String(255))
     note = db.Column(db.String(255))
     created_at = db.Column(
         db.DateTime(timezone=True), default=utcnow, nullable=False, index=True
     )
 
-    cashier = db.relationship("User", back_populates="sales")
+    cashier = db.relationship("User", back_populates="sales", foreign_keys=[cashier_id])
+    voided_by = db.relationship("User", foreign_keys=[voided_by_id])
     items = db.relationship(
         "SaleItem", back_populates="sale", cascade="all, delete-orphan"
     )
@@ -48,6 +61,10 @@ class Sale(db.Model):
             "tax": money_str(self.tax),
             "total": money_str(self.total),
             "payment_status": self.payment_status,
+            "status": self.status,
+            "voided_at": self.voided_at.isoformat() if self.voided_at else None,
+            "voided_by_name": self.voided_by.name if self.voided_by else None,
+            "void_reason": self.void_reason,
             "payment_method": self.payment.payment_method if self.payment else None,
             "item_count": sum(item.quantity for item in self.items),
             "created_at": self.created_at.isoformat() if self.created_at else None,

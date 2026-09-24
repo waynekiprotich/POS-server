@@ -7,13 +7,26 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from app import create_app  # noqa: E402
 from app.extensions import db  # noqa: E402
-from app.models import Category, Product, ROLE_ADMIN, ROLE_CASHIER, User  # noqa: E402
+from app.models import (  # noqa: E402
+    ROLE_ADMIN,
+    ROLE_CASHIER,
+    ROLE_MANAGER,
+    ROLE_VIEWER,
+    Category,
+    Product,
+    User,
+)
+from app.services import scan_pairing  # noqa: E402
+from app.utils.rate_limit import limiter  # noqa: E402
 from config import TestConfig  # noqa: E402
 
 
 @pytest.fixture
-def app():
-    application = create_app(TestConfig)
+def app(tmp_path):
+    config = type("Config", (TestConfig,), {"BACKUP_DIR": str(tmp_path / "backups")})
+    application = create_app(config)
+    scan_pairing.reset()
+    limiter._hits.clear()
     with application.app_context():
         db.create_all()
         yield application
@@ -26,9 +39,11 @@ def client(app):
     return app.test_client()
 
 
-def _make_user(name, username, role, password="password123"):
+def _make_user(name, username, role, password="password123", pin=None):
     user = User(name=name, username=username, email="%s@example.com" % username, role=role)
     user.set_password(password)
+    if pin:
+        user.set_pin(pin)
     db.session.add(user)
     db.session.commit()
     return user
@@ -41,7 +56,17 @@ def admin(app):
 
 @pytest.fixture
 def cashier(app):
-    return _make_user("Cashier", "cashier", ROLE_CASHIER)
+    return _make_user("Cashier", "cashier", ROLE_CASHIER, pin="4321")
+
+
+@pytest.fixture
+def manager(app):
+    return _make_user("Manager", "manager", ROLE_MANAGER, pin="5555")
+
+
+@pytest.fixture
+def viewer(app):
+    return _make_user("Viewer", "viewer", ROLE_VIEWER)
 
 
 @pytest.fixture

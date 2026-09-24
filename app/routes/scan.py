@@ -1,47 +1,76 @@
-from flask import Blueprint, jsonify
+import re
 
+from flask import Blueprint, jsonify, request
+
+from ..permissions import POS_SELL
 from ..services import scan_pairing
-from ..utils.auth import auth_required, current_user
+from ..utils.auth import current_user, permission_required
 from ..utils.errors import ApiError, NotFound
-from ..utils.validation import get_int, get_str, payload
+from ..utils.rate_limit import limiter
+from ..utils.validation import arg_int, get_str, payload
 
 bp = Blueprint("scan", __name__, url_prefix="/api/scan-sessions")
 
+BARCODE_PATTERN = re.compile(r"^[\x21-\x7e]{1,64}$")
+EXPIRED = "This pairing has ended. On the till, open Pair phone and scan the new QR code."
+# Wrong codes per phone address before it must wait; stops code guessing.
+BAD_CODE_LIMIT = 20
+BAD_CODE_WINDOW = 10 * 60
+
+
+def _phone_key():
+    return "scan:%s" % (request.remote_addr or "unknown")
+
+
+def _check_phone():
+    limiter.check(
+        _phone_key(),
+        BAD_CODE_LIMIT,
+        BAD_CODE_WINDOW,
+        "Too many wrong pairing codes from this phone. Wait a few minutes.",
+    )
+
 
 @bp.post("")
-@auth_required
+@permission_required(POS_SELL)
 def create_session():
-    session = scan_pairing.create_session(current_user().id)
-    return jsonify(session), 201
+    return jsonify(scan_pairing.create_session(current_user().id)), 201
 
 
 @bp.get("/<code>/poll")
-@auth_required
+@permission_required(POS_SELL)
 def poll_session(code):
-    from flask import request
-
-    after_id = get_int({"after": request.args.get("after")}, "after", default=0, minimum=0)
-    entries = scan_pairing.poll(code, after_id, current_user().id)
-    if entries is None:
-        raise NotFound("That pairing session has expired. Pair the phone again.")
-    return jsonify({"items": entries})
+    result = scan_pairing.poll(code, arg_int("after", default=0) or 0, current_user().id)
+    if result is None:
+        raise NotFound(EXPIRED)
+    return jsonify(result)
 
 
 @bp.delete("/<code>")
-@auth_required
+@permission_required(POS_SELL)
 def end_session(code):
     scan_pairing.close_session(code, current_user().id)
-    return jsonify({"message": "Session closed."})
+    return jsonify({"message": "Phone disconnected."})
+
+
+@bp.get("/<code>")
+def check_session(code):
+    """The phone checks its code is live before opening the camera."""
+    _check_phone()
+    if not scan_pairing.mark_phone_seen(code):
+        limiter.record(_phone_key())
+        raise ApiError(EXPIRED, status_code=410)
+    return jsonify({"paired": True})
 
 
 @bp.post("/<code>/scan")
 def submit_scan(code):
-    data = payload()
-    barcode = get_str(data, "barcode", required=True, max_length=64)
+    _check_phone()
+    barcode = get_str(payload(), "barcode", required=True, max_length=64)
+    if not BARCODE_PATTERN.match(barcode):
+        raise ApiError("That barcode could not be read. Try again.", field="barcode")
     entry = scan_pairing.push_scan(code, barcode)
     if entry is None:
-        raise ApiError(
-            "This pairing code is no longer valid. Ask the till to show a new one.",
-            status_code=410,
-        )
-    return jsonify({"received": True})
+        limiter.record(_phone_key())
+        raise ApiError(EXPIRED, status_code=410)
+    return jsonify({"received": True, "id": entry["id"]})

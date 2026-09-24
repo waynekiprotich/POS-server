@@ -3,11 +3,13 @@ from sqlalchemy import or_
 
 from ..extensions import db
 from ..models import (
-    MOVEMENT_ADJUSTMENT,
+    MOVEMENT_RESTOCK,
+    Business,
     Category,
     Product,
     Setting,
 )
+from ..permissions import COSTS_VIEW, PRODUCTS_MANAGE
 from ..services.inventory_service import apply_movement
 from ..services.product_service import (
     assert_barcode_available,
@@ -15,7 +17,7 @@ from ..services.product_service import (
     generate_sku,
 )
 from ..utils.activity import log_activity
-from ..utils.auth import admin_required, auth_required, current_user
+from ..utils.auth import auth_required, current_can, current_user, permission_required
 from ..utils.errors import ApiError, NotFound
 from ..utils.money import money_str, quantize, to_decimal
 from ..utils.pagination import paginate
@@ -45,7 +47,6 @@ def _search_filter(query, term):
 @bp.get("")
 @auth_required
 def list_products():
-    user = current_user()
     query = Product.query
 
     term = (request.args.get("q") or "").strip()
@@ -79,7 +80,7 @@ def list_products():
     page, meta = paginate(query)
     return jsonify(
         {
-            "items": [p.to_dict(include_cost=user.is_admin) for p in page.items],
+            "items": [p.to_dict(include_cost=current_can(COSTS_VIEW)) for p in page.items],
             "pagination": meta,
         }
     )
@@ -88,20 +89,32 @@ def list_products():
 @bp.get("/barcode/<barcode>")
 @auth_required
 def lookup_barcode(barcode):
-    user = current_user()
     product = Product.query.filter(
         Product.barcode == barcode.strip(), Product.is_active.is_(True)
     ).first()
     if product is None:
+        archived = Product.query.filter(Product.barcode == barcode.strip()).first()
+        if archived is not None:
+            return (
+                jsonify(
+                    {
+                        "found": False,
+                        "archived": True,
+                        "barcode": barcode.strip(),
+                        "error": "%s is archived and cannot be sold." % archived.name,
+                    }
+                ),
+                404,
+            )
         return jsonify({"found": False, "barcode": barcode.strip()}), 404
-    return jsonify({"found": True, "product": product.to_dict(include_cost=user.is_admin)})
+    return jsonify({"found": True, "product": product.to_dict(include_cost=current_can(COSTS_VIEW))})
 
 
 @bp.get("/<int:product_id>")
 @auth_required
 def get_product(product_id):
     product = _get_or_404(product_id)
-    return jsonify({"product": product.to_dict(include_cost=current_user().is_admin)})
+    return jsonify({"product": product.to_dict(include_cost=current_can(COSTS_VIEW))})
 
 
 def _apply_fields(product, data, creating):
@@ -151,11 +164,11 @@ def _apply_fields(product, data, creating):
 
 
 @bp.post("")
-@admin_required
+@permission_required(PRODUCTS_MANAGE)
 def create_product():
     user = current_user()
     data = payload()
-    product = Product()
+    product = Product(business_id=Business.current_id())
     _apply_fields(product, data, creating=True)
 
     sku = get_str(data, "sku", max_length=60) or generate_sku()
@@ -176,7 +189,7 @@ def create_product():
         apply_movement(
             product,
             opening_stock,
-            MOVEMENT_ADJUSTMENT,
+            MOVEMENT_RESTOCK,
             user=user,
             note="Opening stock",
         )
@@ -193,7 +206,7 @@ def create_product():
 
 
 @bp.patch("/<int:product_id>")
-@admin_required
+@permission_required(PRODUCTS_MANAGE)
 def update_product(product_id):
     user = current_user()
     product = _get_or_404(product_id)
@@ -235,7 +248,7 @@ def update_product(product_id):
 
 
 @bp.delete("/<int:product_id>")
-@admin_required
+@permission_required(PRODUCTS_MANAGE)
 def archive_product(product_id):
     user = current_user()
     product = _get_or_404(product_id)
@@ -248,7 +261,7 @@ def archive_product(product_id):
 
 
 @bp.post("/<int:product_id>/restore")
-@admin_required
+@permission_required(PRODUCTS_MANAGE)
 def restore_product(product_id):
     user = current_user()
     product = _get_or_404(product_id)

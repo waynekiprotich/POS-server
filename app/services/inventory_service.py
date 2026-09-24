@@ -1,3 +1,5 @@
+from sqlalchemy import text
+
 from ..extensions import db
 from ..models import InventoryMovement, Product, Setting
 from ..utils.errors import ApiError
@@ -40,10 +42,19 @@ def apply_movement(
 
 
 def lock_products(product_ids):
-    """Load products for update so two tills cannot oversell the same stock."""
+    """Load products for update so two tills cannot oversell the same stock.
+
+    PostgreSQL locks the rows. SQLite has no row locks, so a no-op write takes
+    the database write lock first: a second till then waits (busy_timeout)
+    and reads the stock only after this transaction commits.
+    """
     if not product_ids:
         return {}
-    query = Product.query.filter(Product.id.in_(list(product_ids)))
-    if db.engine.dialect.name != "sqlite":
+    query = Product.query.filter(Product.id.in_(list(product_ids))).execution_options(
+        populate_existing=True
+    )
+    if db.engine.dialect.name == "sqlite":
+        db.session.execute(text("UPDATE products SET id = id WHERE 0"))
+    else:
         query = query.with_for_update()
     return {p.id: p for p in query.all()}

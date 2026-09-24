@@ -11,6 +11,7 @@ class Product(db.Model):
     __tablename__ = "products"
 
     id = db.Column(db.Integer, primary_key=True)
+    business_id = db.Column(db.Integer, db.ForeignKey("businesses.id"), index=True)
     name = db.Column(db.String(180), nullable=False, index=True)
     description = db.Column(db.Text)
     sku = db.Column(db.String(60), unique=True, nullable=False, index=True)

@@ -4,7 +4,7 @@ from decimal import Decimal
 from sqlalchemy import case, func
 
 from ..extensions import db
-from ..models import Payment, Product, Sale, SaleItem
+from ..models import SALE_COMPLETED, Category, Payment, Product, Sale, SaleItem, User
 from ..utils import dates
 from ..utils.errors import ApiError
 from ..utils.money import money_str, quantize
@@ -54,8 +54,21 @@ def resolve_range(args):
     return start, end, start_date, end_date
 
 
+def _completed(query):
+    """Voided sales stay on record but never count towards totals."""
+    return query.filter(Sale.status == SALE_COMPLETED)
+
+
+def _in_range(query, start, end):
+    if start:
+        query = query.filter(Sale.created_at >= start)
+    if end:
+        query = query.filter(Sale.created_at <= end)
+    return _completed(query)
+
+
 def scoped_sales(start, end):
-    query = Sale.query
+    query = Sale.query.filter(Sale.status == SALE_COMPLETED)
     if start:
         query = query.filter(Sale.created_at >= start)
     if end:
@@ -73,19 +86,20 @@ def sales_summary(start, end):
     ).one()
     count, revenue, discount, tax = row
 
-    cost_row = (
-        db.session.query(func.coalesce(func.sum(SaleItem.cost_price * SaleItem.quantity), 0))
-        .join(Sale, Sale.id == SaleItem.sale_id)
+    cost_row = _in_range(
+        db.session.query(
+            func.coalesce(func.sum(SaleItem.cost_price * SaleItem.quantity), 0)
+        ).join(Sale, Sale.id == SaleItem.sale_id),
+        start,
+        end,
     )
-    units_row = db.session.query(func.coalesce(func.sum(SaleItem.quantity), 0)).join(
-        Sale, Sale.id == SaleItem.sale_id
+    units_row = _in_range(
+        db.session.query(func.coalesce(func.sum(SaleItem.quantity), 0)).join(
+            Sale, Sale.id == SaleItem.sale_id
+        ),
+        start,
+        end,
     )
-    if start:
-        cost_row = cost_row.filter(Sale.created_at >= start)
-        units_row = units_row.filter(Sale.created_at >= start)
-    if end:
-        cost_row = cost_row.filter(Sale.created_at <= end)
-        units_row = units_row.filter(Sale.created_at <= end)
 
     cost = Decimal(str(cost_row.scalar() or 0))
     units = int(units_row.scalar() or 0)
@@ -108,7 +122,7 @@ def sales_trend(days=7):
     today = dates.today()
     first_day = today - timedelta(days=days - 1)
     rows = (
-        db.session.query(Sale.created_at, Sale.total)
+        _completed(db.session.query(Sale.created_at, Sale.total))
         .filter(Sale.created_at >= dates.day_start(first_day))
         .all()
     )
@@ -142,10 +156,7 @@ def product_performance(start, end, limit=None, order_by="units"):
         .join(Sale, Sale.id == SaleItem.sale_id)
         .group_by(SaleItem.product_id, SaleItem.product_name, SaleItem.product_sku)
     )
-    if start:
-        query = query.filter(Sale.created_at >= start)
-    if end:
-        query = query.filter(Sale.created_at <= end)
+    query = _in_range(query, start, end)
 
     sort = {
         "units": func.sum(SaleItem.quantity).desc(),
@@ -188,10 +199,7 @@ def payment_breakdown(start, end):
         .group_by(Payment.payment_method)
         .order_by(func.sum(Payment.amount).desc())
     )
-    if start:
-        query = query.filter(Sale.created_at >= start)
-    if end:
-        query = query.filter(Sale.created_at <= end)
+    query = _in_range(query, start, end)
     return [
         {
             "payment_method": row[0],
@@ -250,3 +258,83 @@ def low_stock_products(limit=10):
         .limit(limit)
         .all()
     )
+
+
+def category_performance(start, end):
+    """Sales per category. Uncategorised items are grouped together."""
+    query = (
+        db.session.query(
+            Category.id,
+            Category.name,
+            func.sum(SaleItem.quantity).label("units"),
+            func.sum(SaleItem.subtotal).label("revenue"),
+            func.sum(SaleItem.cost_price * SaleItem.quantity).label("cost"),
+            func.count(func.distinct(SaleItem.sale_id)).label("transactions"),
+        )
+        .select_from(SaleItem)
+        .join(Sale, Sale.id == SaleItem.sale_id)
+        .outerjoin(Product, Product.id == SaleItem.product_id)
+        .outerjoin(Category, Category.id == Product.category_id)
+        .group_by(Category.id, Category.name)
+        .order_by(func.sum(SaleItem.subtotal).desc())
+    )
+    query = _in_range(query, start, end)
+    results = []
+    for row in query.all():
+        revenue = Decimal(str(row.revenue or 0))
+        cost = Decimal(str(row.cost or 0))
+        results.append(
+            {
+                "category_id": row[0],
+                "category_name": row[1] or "Uncategorised",
+                "units_sold": int(row.units or 0),
+                "revenue": money_str(revenue),
+                "cost": money_str(cost),
+                "gross_profit": money_str(revenue - cost),
+                "transactions": int(row.transactions or 0),
+            }
+        )
+    return results
+
+
+def cashier_performance(start, end):
+    """Completed sales per staff member over the period."""
+    query = (
+        db.session.query(
+            User.id,
+            User.name,
+            func.count(Sale.id).label("transactions"),
+            func.coalesce(func.sum(Sale.total), 0).label("revenue"),
+            func.coalesce(func.sum(Sale.discount), 0).label("discount"),
+        )
+        .join(Sale, Sale.cashier_id == User.id)
+        .group_by(User.id, User.name)
+        .order_by(func.sum(Sale.total).desc())
+    )
+    query = _in_range(query, start, end)
+    voided = (
+        db.session.query(Sale.cashier_id, func.count(Sale.id))
+        .filter(Sale.status != SALE_COMPLETED)
+    )
+    if start:
+        voided = voided.filter(Sale.created_at >= start)
+    if end:
+        voided = voided.filter(Sale.created_at <= end)
+    voided_counts = dict(voided.group_by(Sale.cashier_id).all())
+
+    results = []
+    for row in query.all():
+        revenue = Decimal(str(row.revenue or 0))
+        count = int(row.transactions or 0)
+        results.append(
+            {
+                "user_id": row[0],
+                "name": row[1],
+                "transactions": count,
+                "revenue": money_str(revenue),
+                "discount": money_str(Decimal(str(row.discount or 0))),
+                "average_sale": money_str(quantize(revenue / count) if count else ZERO),
+                "voided": int(voided_counts.get(row[0], 0)),
+            }
+        )
+    return results

@@ -6,14 +6,18 @@ from sqlalchemy.exc import IntegrityError
 from ..extensions import db
 from ..models import (
     MOVEMENT_SALE,
+    MOVEMENT_VOID,
     PAYMENT_METHODS,
+    SALE_COMPLETED,
+    SALE_VOIDED,
+    Business,
     Payment,
-    Product,
-    ROLE_ADMIN,
     Sale,
     SaleItem,
     Setting,
+    utcnow,
 )
+from ..permissions import DISCOUNT_APPLY, has_permission
 from ..utils.errors import ApiError, NotFound
 from ..utils.money import quantize, to_decimal
 from .inventory_service import apply_movement, lock_products
@@ -78,8 +82,8 @@ def create_sale(user, data):
     discount = quantize(to_decimal(data.get("discount"), field="discount", default=ZERO))
     if discount < ZERO:
         raise ApiError("Discount cannot be negative.", field="discount")
-    if discount > ZERO and user.role != ROLE_ADMIN:
-        raise ApiError("Only an administrator can apply a discount.", field="discount")
+    if discount > ZERO and not has_permission(user, DISCOUNT_APPLY):
+        raise ApiError("Only a manager or the owner can apply a discount.", field="discount")
     if discount > subtotal:
         raise ApiError("Discount cannot be larger than the subtotal.", field="discount")
 
@@ -114,8 +118,10 @@ def create_sale(user, data):
         )
 
     sale = Sale(
+        business_id=Business.current_id(),
         sale_number="pending-%s" % uuid4().hex[:12],
         cashier_id=user.id,
+        status=SALE_COMPLETED,
         subtotal=subtotal,
         discount=discount,
         tax=tax,
@@ -170,15 +176,52 @@ def create_sale(user, data):
     return sale
 
 
-def receipt_payload(sale, settings=None):
+def void_sale(sale_id, user, reason):
+    """Mark a completed sale void and put its stock back, in one transaction.
+
+    The sale, its items and payment stay exactly as recorded; reports simply
+    stop counting it. Each returned item gets a VOID inventory movement.
+    """
+    # Take the write lock before reading the sale so two voids cannot race.
+    sale = Sale.query.filter(Sale.id == sale_id).first()
+    if sale is None:
+        raise NotFound("That sale could not be found.")
+    products = lock_products({item.product_id for item in sale.items if item.product_id})
+    db.session.refresh(sale)
+    if sale.status == SALE_VOIDED:
+        raise ApiError("This sale has already been voided.")
+
+    for item in sale.items:
+        product = products.get(item.product_id)
+        if product is None:
+            continue
+        apply_movement(
+            product,
+            item.quantity,
+            MOVEMENT_VOID,
+            user=user,
+            reference=sale.sale_number,
+            note=reason,
+        )
+    sale.status = SALE_VOIDED
+    sale.voided_at = utcnow()
+    sale.voided_by_id = user.id
+    sale.void_reason = reason
+    return sale
+
+
+def receipt_payload(sale, settings=None, include_cost=False):
     settings = settings or Setting.as_dict()
     return {
-        "sale": sale.to_dict(include_items=True),
+        "sale": sale.to_dict(include_items=True, include_cost=include_cost),
         "business": {
             "name": settings.get("business_name"),
             "address": settings.get("business_address"),
             "phone": settings.get("business_phone"),
             "email": settings.get("business_email"),
+            "tax_pin": settings.get("business_tax_pin"),
+            "receipt_width": settings.get("receipt_width"),
+            "show_cashier": settings.get("receipt_show_cashier") != "false",
             "footer": settings.get("receipt_footer"),
             "currency": settings.get("currency"),
             "currency_symbol": settings.get("currency_symbol"),

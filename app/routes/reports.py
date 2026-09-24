@@ -1,7 +1,10 @@
 from flask import Blueprint, jsonify, request
 
 from ..models import Sale
+from ..permissions import COSTS_VIEW, REPORTS_VIEW
 from ..services.report_service import (
+    cashier_performance,
+    category_performance,
     inventory_summary,
     low_stock_products,
     payment_breakdown,
@@ -10,7 +13,7 @@ from ..services.report_service import (
     sales_summary,
     sales_trend,
 )
-from ..utils.auth import admin_required
+from ..utils.auth import current_can, permission_required
 from ..utils.errors import ApiError
 
 bp = Blueprint("reports", __name__, url_prefix="/api/reports")
@@ -27,7 +30,7 @@ def _range():
 
 
 @bp.get("/summary")
-@admin_required
+@permission_required(REPORTS_VIEW)
 def summary():
     start, end, meta = _range()
     try:
@@ -44,16 +47,17 @@ def summary():
             "range": meta,
             "totals": sales_summary(start, end),
             "trend": sales_trend(trend_days),
-            "recent_sales": [s.to_dict() for s in recent],
+            "recent_sales": [s.to_dict(include_cost=current_can(COSTS_VIEW)) for s in recent],
             "low_stock": [p.to_dict() for p in low_stock_products(8)],
             "top_products": product_performance(start, end, limit=5, order_by="units"),
+            "payments": payment_breakdown(start, end),
             "inventory": inventory_summary(),
         }
     )
 
 
 @bp.get("/sales")
-@admin_required
+@permission_required(REPORTS_VIEW)
 def sales_report():
     start, end, meta = _range()
     return jsonify(
@@ -66,7 +70,7 @@ def sales_report():
 
 
 @bp.get("/products")
-@admin_required
+@permission_required(REPORTS_VIEW)
 def products_report():
     start, end, meta = _range()
     order_by = request.args.get("order_by", "units")
@@ -79,7 +83,7 @@ def products_report():
 
 
 @bp.get("/profit")
-@admin_required
+@permission_required(REPORTS_VIEW)
 def profit_report():
     start, end, meta = _range()
     return jsonify(
@@ -92,14 +96,14 @@ def profit_report():
 
 
 @bp.get("/payments")
-@admin_required
+@permission_required(REPORTS_VIEW)
 def payments_report():
     start, end, meta = _range()
     return jsonify({"range": meta, "items": payment_breakdown(start, end)})
 
 
 @bp.get("/inventory")
-@admin_required
+@permission_required(REPORTS_VIEW)
 def inventory_report():
     return jsonify(
         {
@@ -107,3 +111,17 @@ def inventory_report():
             "low_stock": [p.to_dict() for p in low_stock_products(100)],
         }
     )
+
+
+@bp.get("/categories")
+@permission_required(REPORTS_VIEW)
+def categories_report():
+    start, end, meta = _range()
+    return jsonify({"range": meta, "items": category_performance(start, end)})
+
+
+@bp.get("/cashiers")
+@permission_required(REPORTS_VIEW)
+def cashiers_report():
+    start, end, meta = _range()
+    return jsonify({"range": meta, "items": cashier_performance(start, end)})

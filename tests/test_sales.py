@@ -167,4 +167,4 @@ def test_cashier_cannot_apply_a_discount(client, cashier, auth, product_factory)
         headers=auth("cashier"),
     )
     assert response.status_code == 400
-    assert "administrator" in response.get_json()["error"]
+    assert "manager or the owner" in response.get_json()["error"]

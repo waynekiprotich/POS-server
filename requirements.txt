@@ -9,3 +9,4 @@ bcrypt==4.2.1
 SQLAlchemy==2.0.36
 psycopg[binary]==3.2.13
 gunicorn==23.0.0
+tzdata==2026.4

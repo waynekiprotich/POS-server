@@ -1,7 +1,21 @@
-from . import auth, categories, inventory, products, reports, sales, scan, settings, users
+from . import (
+    auth,
+    backups,
+    categories,
+    inventory,
+    products,
+    reports,
+    sales,
+    scan,
+    settings,
+    setup,
+    system,
+    users,
+)
 
 BLUEPRINTS = (
     auth.bp,
+    setup.bp,
     products.bp,
     categories.bp,
     inventory.bp,
@@ -10,4 +24,6 @@ BLUEPRINTS = (
     users.bp,
     settings.bp,
     scan.bp,
+    system.bp,
+    backups.bp,
 )

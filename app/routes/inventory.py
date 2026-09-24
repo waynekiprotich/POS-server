@@ -2,16 +2,20 @@ from flask import Blueprint, jsonify, request
 
 from ..extensions import db
 from ..models import (
+    MANUAL_MOVEMENT_TYPES,
     MOVEMENT_ADJUSTMENT,
+    MOVEMENT_DAMAGED,
+    MOVEMENT_EXPIRED,
     MOVEMENT_RESTOCK,
-    MOVEMENT_TYPES,
+    MOVEMENT_RETURN,
     InventoryMovement,
     Product,
 )
+from ..permissions import COSTS_VIEW, INVENTORY_MANAGE, INVENTORY_VIEW
 from ..services.inventory_service import apply_movement, lock_products
 from ..services.report_service import inventory_summary
 from ..utils.activity import log_activity
-from ..utils.auth import admin_required, current_user
+from ..utils.auth import current_can, current_user, permission_required
 from ..utils.errors import ApiError, NotFound
 from ..utils.pagination import paginate
 from ..utils.validation import arg_int, get_choice, get_int, get_str, payload
@@ -19,8 +23,13 @@ from ..utils.validation import arg_int, get_choice, get_int, get_str, payload
 bp = Blueprint("inventory", __name__, url_prefix="/api/inventory")
 
 
+# Stock in / customer return can only add; damage and expiry can only remove.
+ONLY_INCREASE = (MOVEMENT_RESTOCK, MOVEMENT_RETURN)
+ONLY_DECREASE = (MOVEMENT_DAMAGED, MOVEMENT_EXPIRED)
+
+
 @bp.get("")
-@admin_required
+@permission_required(INVENTORY_VIEW)
 def list_inventory():
     query = Product.query.filter(Product.is_active.is_(True))
 
@@ -49,7 +58,7 @@ def list_inventory():
     page, meta = paginate(query)
     return jsonify(
         {
-            "items": [p.to_dict() for p in page.items],
+            "items": [p.to_dict(include_cost=current_can(COSTS_VIEW)) for p in page.items],
             "pagination": meta,
             "summary": inventory_summary(),
         }
@@ -57,7 +66,7 @@ def list_inventory():
 
 
 @bp.post("/adjust")
-@admin_required
+@permission_required(INVENTORY_MANAGE)
 def adjust_inventory():
     user = current_user()
     data = payload()
@@ -68,9 +77,10 @@ def adjust_inventory():
         raise NotFound("That product could not be found.")
 
     movement_type = get_choice(
-        data, "movement_type", MOVEMENT_TYPES, default=MOVEMENT_ADJUSTMENT
+        data, "movement_type", MANUAL_MOVEMENT_TYPES, default=MOVEMENT_ADJUSTMENT
     )
     note = get_str(data, "note", max_length=255)
+    reference = get_str(data, "reference", max_length=80)
 
     if "new_quantity" in data and data.get("new_quantity") not in (None, ""):
         new_quantity = get_int(data, "new_quantity", minimum=0)
@@ -80,11 +90,20 @@ def adjust_inventory():
 
     if change == 0:
         raise ApiError("Enter a quantity that changes the current stock level.")
-    if change > 0 and movement_type not in (MOVEMENT_RESTOCK, MOVEMENT_ADJUSTMENT, "RETURN"):
-        movement_type = MOVEMENT_RESTOCK
+    if movement_type in ONLY_INCREASE and change < 0:
+        raise ApiError(
+            "Stock in and returns add stock. Use Damaged, Expired or Correction to remove it.",
+            field="movement_type",
+        )
+    if movement_type in ONLY_DECREASE and change > 0:
+        raise ApiError(
+            "Damaged and expired stock can only be removed.", field="movement_type"
+        )
 
     previous = product.stock_quantity
-    apply_movement(product, change, movement_type, user=user, note=note)
+    apply_movement(
+        product, change, movement_type, user=user, reference=reference, note=note
+    )
     log_activity(
         user,
         "inventory.adjusted",
@@ -94,11 +113,11 @@ def adjust_inventory():
         % (product.name, previous, product.stock_quantity, movement_type),
     )
     db.session.commit()
-    return jsonify({"product": product.to_dict()})
+    return jsonify({"product": product.to_dict(include_cost=current_can(COSTS_VIEW))})
 
 
 @bp.get("/movements")
-@admin_required
+@permission_required(INVENTORY_VIEW)
 def list_movements():
     query = InventoryMovement.query
     product_id = request.args.get("product_id")

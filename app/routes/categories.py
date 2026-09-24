@@ -2,9 +2,10 @@ from flask import Blueprint, jsonify, request
 from sqlalchemy import func
 
 from ..extensions import db
-from ..models import Category
+from ..models import Business, Category
+from ..permissions import PRODUCTS_MANAGE
 from ..utils.activity import log_activity
-from ..utils.auth import admin_required, auth_required, current_user
+from ..utils.auth import auth_required, current_user, permission_required
 from ..utils.errors import Conflict, NotFound
 from ..utils.validation import get_bool, get_str, payload
 
@@ -30,13 +31,15 @@ def list_categories():
 
 
 @bp.post("")
-@admin_required
+@permission_required(PRODUCTS_MANAGE)
 def create_category():
     data = payload()
     name = get_str(data, "name", required=True, max_length=120)
     _assert_name_free(name)
     category = Category(
-        name=name, description=get_str(data, "description", max_length=255)
+        business_id=Business.current_id(),
+        name=name,
+        description=get_str(data, "description", max_length=255),
     )
     db.session.add(category)
     db.session.flush()
@@ -48,7 +51,7 @@ def create_category():
 
 
 @bp.patch("/<int:category_id>")
-@admin_required
+@permission_required(PRODUCTS_MANAGE)
 def update_category(category_id):
     category = db.session.get(Category, category_id)
     if category is None:
